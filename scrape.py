@@ -1,169 +1,89 @@
 import os
 import csv
 import json
+import tempfile
 from datetime import datetime, timedelta
-from playwright.sync_api import sync_playwright
+from google.analytics.data_v1beta import BetaAnalyticsDataClient
+from google.analytics.data_v1beta.types import (
+    RunReportRequest,
+    DateRange,
+    Metric,
+    Dimension,
+)
 
-IMWEB_EMAIL = os.environ["IMWEB_EMAIL"]
-IMWEB_PASSWORD = os.environ["IMWEB_PASSWORD"]
-SITE_URL = os.environ.get("IMWEB_SITE_URL", "https://closedmockexam.imweb.me")
-CSV_FILE = os.path.join(os.path.dirname(__file__), "visitors.csv")
-
-
-def login(page):
-    """아임웹 로그인"""
-    page.goto("https://imweb.me/login")
-    page.wait_for_load_state("networkidle")
-
-    page.fill('input[type="email"], input[name="email"], input[placeholder*="이메일"]', IMWEB_EMAIL)
-    page.fill('input[type="password"], input[name="password"]', IMWEB_PASSWORD)
-    page.click('button[type="submit"]')
-
-    page.wait_for_load_state("networkidle")
-    page.wait_for_timeout(3000)
+GA4_PROPERTY_ID = os.environ["GA4_PROPERTY_ID"]
+CSV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "visitors.csv")
 
 
-def get_visitor_count(page):
-    """관리자 통계 페이지에서 어제 방문자 수 가져오기"""
-    # 관리자 페이지 접속
-    page.goto(f"{SITE_URL}/admin")
-    page.wait_for_load_state("networkidle")
-    page.wait_for_timeout(5000)
-
-    # 통계 페이지로 이동 시도
-    stats_urls = [
-        f"{SITE_URL}/admin/statistics",
-        f"{SITE_URL}/admin/stat",
-        f"{SITE_URL}/admin/analytics",
-    ]
-
-    for url in stats_urls:
-        page.goto(url)
-        page.wait_for_load_state("networkidle")
-        page.wait_for_timeout(3000)
-        if "stat" in page.url.lower() or "analytics" in page.url.lower():
-            break
-
-    # 페이지 내용에서 방문자 수 추출 시도
-    # 아임웹 관리자 대시보드에서 방문자 수 텍스트를 찾음
-    page.wait_for_timeout(3000)
-
-    # 스크린샷 저장 (디버깅용)
-    page.screenshot(path="debug_screenshot.png", full_page=True)
-
-    # 방문자 수 추출 - 여러 셀렉터 시도
-    visitor_count = None
-
-    # 방법 1: API 호출로 통계 데이터 가져오기
-    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-    today = datetime.now().strftime("%Y-%m-%d")
-
-    try:
-        # 아임웹 내부 API 호출 시도
-        response = page.evaluate("""
-            async () => {
-                const urls = [
-                    '/admin/api/statistics/visitor',
-                    '/admin/api/stat/visitor',
-                    '/admin/api/analytics/visitor',
-                ];
-                for (const url of urls) {
-                    try {
-                        const res = await fetch(url);
-                        if (res.ok) {
-                            return { url, data: await res.json() };
-                        }
-                    } catch(e) {}
-                }
-                return null;
-            }
-        """)
-        if response:
-            print(f"API response from {response['url']}: {json.dumps(response['data'], indent=2)}")
-    except Exception as e:
-        print(f"API approach failed: {e}")
-
-    # 방법 2: 페이지에서 텍스트 추출
-    try:
-        content = page.content()
-        print(f"Page URL: {page.url}")
-        print(f"Page title: {page.title()}")
-
-        # 방문자 관련 요소 찾기
-        selectors = [
-            'text=방문자',
-            'text=visitor',
-            '.stat-visitor',
-            '.visitor-count',
-            '[class*="visitor"]',
-            '[class*="stat"]',
-        ]
-
-        for selector in selectors:
-            try:
-                elements = page.query_selector_all(selector)
-                for el in elements:
-                    text = el.inner_text()
-                    print(f"Found [{selector}]: {text}")
-            except Exception:
-                pass
-    except Exception as e:
-        print(f"Text extraction failed: {e}")
-
-    # 방법 3: 대시보드 숫자 추출
-    try:
-        all_text = page.inner_text("body")
-        print(f"\n=== Page text (first 3000 chars) ===\n{all_text[:3000]}")
-    except Exception as e:
-        print(f"Body text extraction failed: {e}")
-
-    return yesterday, visitor_count
+def get_client():
+    """GA4 인증 클라이언트 생성"""
+    creds_json = os.environ["GA4_CREDENTIALS"]
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        f.write(creds_json)
+        creds_path = f.name
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = creds_path
+    return BetaAnalyticsDataClient()
 
 
-def save_to_csv(date, visitors):
-    """CSV 파일에 저장"""
+def fetch_visitors(client, start_date="7daysAgo", end_date="yesterday"):
+    """GA4에서 일별 방문자 수 가져오기"""
+    request = RunReportRequest(
+        property=f"properties/{GA4_PROPERTY_ID}",
+        date_ranges=[DateRange(start_date=start_date, end_date=end_date)],
+        dimensions=[Dimension(name="date")],
+        metrics=[Metric(name="activeUsers")],
+    )
+    response = client.run_report(request)
+
+    results = {}
+    for row in response.rows:
+        raw_date = row.dimension_values[0].value  # YYYYMMDD
+        date = f"{raw_date[:4]}-{raw_date[4:6]}-{raw_date[6:8]}"
+        visitors = int(row.metric_values[0].value)
+        results[date] = visitors
+
+    return results
+
+
+def load_csv():
+    """기존 CSV 데이터 로드"""
     existing = {}
     if os.path.exists(CSV_FILE):
         with open(CSV_FILE, "r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for row in reader:
-                existing[row["date"]] = row["visitors"]
+                if row["date"] and row["visitors"]:
+                    existing[row["date"]] = int(row["visitors"])
+    return existing
 
-    existing[date] = str(visitors) if visitors else "N/A"
 
-    sorted_dates = sorted(existing.keys(), reverse=True)
-
+def save_csv(data):
+    """CSV 파일 저장 (날짜 내림차순)"""
+    sorted_dates = sorted(data.keys(), reverse=True)
     with open(CSV_FILE, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=["date", "visitors"])
         writer.writeheader()
-        for d in sorted_dates:
-            writer.writerow({"date": d, "visitors": existing[d]})
-
-    print(f"Saved: {date} -> {visitors} visitors")
+        for date in sorted_dates:
+            writer.writerow({"date": date, "visitors": data[date]})
+    print(f"Saved {len(data)} rows to {CSV_FILE}")
 
 
 def main():
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(
-            viewport={"width": 1920, "height": 1080},
-            locale="ko-KR",
-        )
-        page = context.new_page()
+    client = get_client()
 
-        try:
-            print("Logging in...")
-            login(page)
-            print("Login complete. Fetching stats...")
-            date, visitors = get_visitor_count(page)
-            print(f"Date: {date}, Visitors: {visitors}")
-            save_to_csv(date, visitors)
-        except Exception as e:
-            print(f"Error: {e}")
-            page.screenshot(path="error_screenshot.png", full_page=True)
-            raise
-        finally:
-            browser.close()
+    # 기존 데이터 로드
+    existing = load_csv()
+    print(f"Existing data: {len(existing)} rows")
+
+    # 최근 7일 데이터 가져오기
+    new_data = fetch_visitors(client, start_date="7daysAgo", end_date="yesterday")
+    print(f"Fetched from GA4: {new_data}")
+
+    # 병합 (새 데이터가 기존 데이터 덮어씀)
+    existing.update(new_data)
+
+    # 저장
+    save_csv(existing)
 
 
 if __name__ == "__main__":
