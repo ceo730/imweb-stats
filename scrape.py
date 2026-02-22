@@ -2,7 +2,6 @@ import os
 import csv
 import json
 import tempfile
-from datetime import datetime, timedelta
 from google.analytics.data_v1beta import BetaAnalyticsDataClient
 from google.analytics.data_v1beta.types import (
     RunReportRequest,
@@ -11,8 +10,9 @@ from google.analytics.data_v1beta.types import (
     Dimension,
 )
 
-GA4_PROPERTY_ID = os.environ["GA4_PROPERTY_ID"]
-CSV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "visitors.csv")
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(SCRIPT_DIR, "data")
+SITES_FILE = os.path.join(SCRIPT_DIR, "sites.json")
 
 
 def get_client():
@@ -25,10 +25,10 @@ def get_client():
     return BetaAnalyticsDataClient()
 
 
-def fetch_visitors(client, start_date="7daysAgo", end_date="yesterday"):
+def fetch_visitors(client, property_id, start_date="7daysAgo", end_date="yesterday"):
     """GA4에서 일별 방문자 수 가져오기"""
     request = RunReportRequest(
-        property=f"properties/{GA4_PROPERTY_ID}",
+        property=f"properties/{property_id}",
         date_ranges=[DateRange(start_date=start_date, end_date=end_date)],
         dimensions=[Dimension(name="date")],
         metrics=[Metric(name="activeUsers")],
@@ -37,7 +37,7 @@ def fetch_visitors(client, start_date="7daysAgo", end_date="yesterday"):
 
     results = {}
     for row in response.rows:
-        raw_date = row.dimension_values[0].value  # YYYYMMDD
+        raw_date = row.dimension_values[0].value
         date = f"{raw_date[:4]}-{raw_date[4:6]}-{raw_date[6:8]}"
         visitors = int(row.metric_values[0].value)
         results[date] = visitors
@@ -45,11 +45,11 @@ def fetch_visitors(client, start_date="7daysAgo", end_date="yesterday"):
     return results
 
 
-def load_csv():
+def load_csv(csv_path):
     """기존 CSV 데이터 로드"""
     existing = {}
-    if os.path.exists(CSV_FILE):
-        with open(CSV_FILE, "r", encoding="utf-8") as f:
+    if os.path.exists(csv_path):
+        with open(csv_path, "r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for row in reader:
                 if row["date"] and row["visitors"]:
@@ -57,33 +57,42 @@ def load_csv():
     return existing
 
 
-def save_csv(data):
+def save_csv(csv_path, data):
     """CSV 파일 저장 (날짜 내림차순)"""
     sorted_dates = sorted(data.keys(), reverse=True)
-    with open(CSV_FILE, "w", encoding="utf-8", newline="") as f:
+    with open(csv_path, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=["date", "visitors"])
         writer.writeheader()
         for date in sorted_dates:
             writer.writerow({"date": date, "visitors": data[date]})
-    print(f"Saved {len(data)} rows to {CSV_FILE}")
+    print(f"  Saved {len(data)} rows")
 
 
 def main():
     client = get_client()
+    os.makedirs(DATA_DIR, exist_ok=True)
 
-    # 기존 데이터 로드
-    existing = load_csv()
-    print(f"Existing data: {len(existing)} rows")
+    with open(SITES_FILE, "r", encoding="utf-8") as f:
+        sites = json.load(f)
 
-    # 최근 7일 데이터 가져오기
-    new_data = fetch_visitors(client, start_date="7daysAgo", end_date="yesterday")
-    print(f"Fetched from GA4: {new_data}")
+    for site in sites:
+        name = site["name"]
+        property_id = site["property_id"]
+        csv_path = os.path.join(DATA_DIR, f"{name}.csv")
 
-    # 병합 (새 데이터가 기존 데이터 덮어씀)
-    existing.update(new_data)
+        print(f"[{name}] property_id={property_id}")
 
-    # 저장
-    save_csv(existing)
+        try:
+            existing = load_csv(csv_path)
+            print(f"  Existing: {len(existing)} rows")
+
+            new_data = fetch_visitors(client, property_id)
+            print(f"  Fetched: {new_data}")
+
+            existing.update(new_data)
+            save_csv(csv_path, existing)
+        except Exception as e:
+            print(f"  ERROR: {e}")
 
 
 if __name__ == "__main__":
